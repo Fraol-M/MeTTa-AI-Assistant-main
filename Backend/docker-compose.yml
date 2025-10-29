@@ -1,7 +1,9 @@
-﻿version: "3.9"
-services:
+﻿services:
   api:
     build: .
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     command: python -m app.run
     ports:
       - "8000:8000"
