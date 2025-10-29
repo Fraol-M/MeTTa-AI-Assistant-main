@@ -22,15 +22,16 @@ jobs:
           --health-retries 5
       
       qdrant:
-        image: qdrant/qdrant:latest
+        # Use a known stable tag instead of `latest` to avoid unexpected regressions
+        image: qdrant/qdrant:v1.7.3
         ports:
           - 6333:6333
           - 6334:6334
         options: >-
           --health-cmd "curl -f http://localhost:6333/health || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+          --health-interval 15s
+          --health-timeout 10s
+          --health-retries 20
 
     steps:
     - uses: actions/checkout@v4
@@ -85,17 +86,48 @@ jobs:
           sleep 2
         done
     
-    - name: Wait for Qdrant to be ready
+    - name: Wait for Qdrant to be ready (extended + diagnostics)
       run: |
         echo "Waiting for Qdrant..."
-        for i in {1..30}; do
+        READY=0
+        for i in {1..60}; do
           if curl -f http://localhost:6333/health > /dev/null 2>&1; then
             echo "Qdrant is ready!"
+            READY=1
             break
           fi
-          echo "Attempt $i/30: Qdrant not ready yet, waiting..."
-          sleep 2
+          echo "Attempt $i/60: Qdrant not ready yet, waiting 5s..."
+          sleep 5
         done
+
+        if [ "$READY" -ne 1 ]; then
+          echo "Qdrant did not become healthy after waiting. Gathering diagnostics..."
+          echo "=== curl /health output ==="
+          curl -v http://localhost:6333/health || true
+          echo "=== docker ps (all) ==="
+          docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}" || true
+          # try to print logs from containers whose image contains 'qdrant'
+          QDRANT_IDS=$(docker ps -a --filter ancestor=qdrant/qdrant:v1.7.3 --format '{{.ID}}' || true)
+          if [ -n "$QDRANT_IDS" ]; then
+            for id in $QDRANT_IDS; do
+              echo "=== docker logs for $id ==="
+              docker logs --tail 200 $id || true
+            done
+          else
+            echo "No qdrant containers found by ancestor filter; attempting name grep..."
+            QDRANT_IDS=$(docker ps -a --format '{{.ID}} {{.Names}} {{.Image}}' | grep -i qdrant | awk '{print $1}' || true)
+            if [ -n "$QDRANT_IDS" ]; then
+              for id in $QDRANT_IDS; do
+                echo "=== docker logs for $id ==="
+                docker logs --tail 200 $id || true
+              done
+            else
+              echo "Could not find qdrant container to print logs."
+            fi
+          fi
+          echo "Failing the job because Qdrant is not healthy."
+          exit 1
+        fi
     
     - name: Run unit tests
       working-directory: ./Backend
@@ -124,4 +156,3 @@ jobs:
       working-directory: ./Backend
       run: |
         pytest --cov=app --cov-report=term-missing --cov-fail-under=60 || echo "Coverage below threshold, but continuing..."
-
