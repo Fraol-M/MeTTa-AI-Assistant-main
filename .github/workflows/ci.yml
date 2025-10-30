@@ -30,39 +30,16 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Build Docker image for tests
-      run: docker build -t metta-backend-ci ./Backend
-
-    - name: Set environment variables
+    - name: Start services with docker-compose
       run: |
-        echo "JWT_SECRET=test-secret-key-for-ci" >> $GITHUB_ENV
-        echo "MONGO_URI=mongodb://mongodb:27017" >> $GITHUB_ENV
-        echo "MONGO_DB=metta_test_db" >> $GITHUB_ENV
-        echo "QDRANT_HOST=qdrant" >> $GITHUB_ENV
-        echo "QDRANT_PORT=6333" >> $GITHUB_ENV
-        echo "COLLECTION_NAME=test_collection" >> $GITHUB_ENV
-        echo "ADMIN_EMAIL=admin@test.com" >> $GITHUB_ENV
-        echo "ADMIN_PASSWORD=test_admin_password" >> $GITHUB_ENV
-        echo "MIN_SCORE=0.0" >> $GITHUB_ENV
+        docker compose -f Backend/docker-compose.yml up --build -d
 
-    - name: Wait for MongoDB to be ready
+    - name: Wait for Qdrant to be ready (compose)
       run: |
-        echo "Waiting for MongoDB..."
-        for i in {1..30}; do
-          if mongosh --host mongodb --eval "db.adminCommand(\"ping\")" > /dev/null 2>&1; then
-            echo "MongoDB is ready!"
-            break
-          fi
-          echo "Attempt $i/30: MongoDB not ready yet..."
-          sleep 2
-        done
-
-    - name: Wait for Qdrant to be ready
-      run: |
-        echo "Waiting for Qdrant..."
+        echo "Waiting for Qdrant (compose)..."
         READY=0
         for i in {1..60}; do
-          if curl -f http://localhost:6333/health > /dev/null 2>&1; then
+          if curl -sSf http://localhost:6333/health > /dev/null 2>&1; then
             echo "Qdrant is ready!"
             READY=1
             break
@@ -73,26 +50,19 @@ jobs:
 
         if [ "$READY" -ne 1 ]; then
           echo "Qdrant did not become healthy. Showing logs:"
-          docker logs $(docker ps -aqf "ancestor=qdrant/qdrant:v1.7.3") || true
+          docker compose -f Backend/docker-compose.yml logs qdrant --no-color || true
+          docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}" || true
           exit 1
         fi
 
-    - name: Run tests inside Docker container
+    - name: Run tests inside `api` service container (compose)
       run: |
-        docker run --rm \
-          -v "$GITHUB_WORKSPACE/Backend":/app \
-          -w /app \
-          -e JWT_SECRET \
-          -e MONGO_URI \
-          -e MONGO_DB \
-          -e QDRANT_HOST \
-          -e QDRANT_PORT \
-          -e COLLECTION_NAME \
-          -e ADMIN_EMAIL \
-          -e ADMIN_PASSWORD \
-          -e MIN_SCORE \
-          metta-backend-ci \
-          bash -lc "pytest tests/unit -v --cov=app --cov-report=xml:coverage.xml --cov-report=term-missing && pytest tests/integration -v --cov=app --cov-append --cov-report=xml:coverage.xml --cov-report=term-missing && pytest --cov=app --cov-report=html --cov-report=term-missing"
+        docker compose -f Backend/docker-compose.yml exec -T api bash -lc "pytest tests/unit -v --cov=app --cov-report=xml:coverage.xml --cov-report=term-missing && pytest tests/integration -v --cov=app --cov-append --cov-report=xml:coverage.xml --cov-report=term-missing && pytest --cov=app --cov-report=html --cov-report=term-missing || true"
+
+    - name: Tear down docker-compose stack
+      if: always()
+      run: |
+        docker compose -f Backend/docker-compose.yml down -v
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
