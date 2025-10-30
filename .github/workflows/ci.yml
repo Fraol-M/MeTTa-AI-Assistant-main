@@ -13,64 +13,51 @@ jobs:
     services:
       mongodb:
         image: mongo:7.0
-        ports:
-          - 27017:27017
         options: >-
           --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
           --health-interval 10s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
       
       qdrant:
-        # Use a known stable tag instead of `latest` to avoid unexpected regressions
         image: qdrant/qdrant:v1.7.3
-        ports:
-          - 6333:6333
-          - 6334:6334
         options: >-
           --health-cmd "curl -f http://localhost:6333/health || exit 1"
-          --health-interval 15s
+          --health-interval 20s
           --health-timeout 10s
-          --health-retries 20
+          --health-retries 40
 
     steps:
     - uses: actions/checkout@v4
     
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y git curl mongodb-mongosh
-
     - name: Build Docker image for tests
-      run: |
-        docker build -t metta-backend-ci ./Backend
+      run: docker build -t metta-backend-ci ./Backend
 
-    - name: Set up test environment variables (for runner and container)
+    - name: Set environment variables
       run: |
-        # services are exposed on the runner's localhost; the container will use --network host
         echo "JWT_SECRET=test-secret-key-for-ci" >> $GITHUB_ENV
-        echo "MONGO_URI=mongodb://localhost:27017" >> $GITHUB_ENV
+        echo "MONGO_URI=mongodb://mongodb:27017" >> $GITHUB_ENV
         echo "MONGO_DB=metta_test_db" >> $GITHUB_ENV
-        echo "QDRANT_HOST=localhost" >> $GITHUB_ENV
+        echo "QDRANT_HOST=qdrant" >> $GITHUB_ENV
         echo "QDRANT_PORT=6333" >> $GITHUB_ENV
         echo "COLLECTION_NAME=test_collection" >> $GITHUB_ENV
         echo "ADMIN_EMAIL=admin@test.com" >> $GITHUB_ENV
         echo "ADMIN_PASSWORD=test_admin_password" >> $GITHUB_ENV
         echo "MIN_SCORE=0.0" >> $GITHUB_ENV
-    
+
     - name: Wait for MongoDB to be ready
       run: |
         echo "Waiting for MongoDB..."
         for i in {1..30}; do
-          if mongosh --host localhost:27017 --eval "db.adminCommand(\"ping\")" > /dev/null 2>&1; then
+          if mongosh --host mongodb --eval "db.adminCommand(\"ping\")" > /dev/null 2>&1; then
             echo "MongoDB is ready!"
             break
           fi
-          echo "Attempt $i/30: MongoDB not ready yet, waiting..."
+          echo "Attempt $i/30: MongoDB not ready yet..."
           sleep 2
         done
-    
-    - name: Wait for Qdrant to be ready (extended + diagnostics)
+
+    - name: Wait for Qdrant to be ready
       run: |
         echo "Waiting for Qdrant..."
         READY=0
@@ -85,38 +72,14 @@ jobs:
         done
 
         if [ "$READY" -ne 1 ]; then
-          echo "Qdrant did not become healthy after waiting. Gathering diagnostics..."
-          echo "=== curl /health output ==="
-          curl -v http://localhost:6333/health || true
-          echo "=== docker ps (all) ==="
-          docker ps -a --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}" || true
-          # try to print logs from containers whose image contains 'qdrant'
-          QDRANT_IDS=$(docker ps -a --filter ancestor=qdrant/qdrant:v1.7.3 --format '{{.ID}}' || true)
-          if [ -n "$QDRANT_IDS" ]; then
-            for id in $QDRANT_IDS; do
-              echo "=== docker logs for $id ==="
-              docker logs --tail 200 $id || true
-            done
-          else
-            echo "No qdrant containers found by ancestor filter; attempting name grep..."
-            QDRANT_IDS=$(docker ps -a --format '{{.ID}} {{.Names}} {{.Image}}' | grep -i qdrant | awk '{print $1}' || true)
-            if [ -n "$QDRANT_IDS" ]; then
-              for id in $QDRANT_IDS; do
-                echo "=== docker logs for $id ==="
-                docker logs --tail 200 $id || true
-              done
-            else
-              echo "Could not find qdrant container to print logs."
-            fi
-          fi
-          echo "Failing the job because Qdrant is not healthy."
+          echo "Qdrant did not become healthy. Showing logs:"
+          docker logs $(docker ps -aqf "ancestor=qdrant/qdrant:v1.7.3") || true
           exit 1
         fi
-    
+
     - name: Run tests inside Docker container
       run: |
-        # mount Backend so coverage files are written back to the workspace
-        docker run --rm --network host \
+        docker run --rm \
           -v "$GITHUB_WORKSPACE/Backend":/app \
           -w /app \
           -e JWT_SECRET \
@@ -129,8 +92,8 @@ jobs:
           -e ADMIN_PASSWORD \
           -e MIN_SCORE \
           metta-backend-ci \
-          bash -lc "pytest tests/unit -v --cov=app --cov-report=xml:coverage.xml --cov-report=term-missing && pytest tests/integration -v --cov=app --cov-append --cov-report=xml:coverage.xml --cov-report=term-missing && pytest --cov=app --cov-report=html --cov-report=term-missing || true"
-    
+          bash -lc "pytest tests/unit -v --cov=app --cov-report=xml:coverage.xml --cov-report=term-missing && pytest tests/integration -v --cov=app --cov-append --cov-report=xml:coverage.xml --cov-report=term-missing && pytest --cov=app --cov-report=html --cov-report=term-missing"
+
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v4
       with:
@@ -138,17 +101,3 @@ jobs:
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
-
-    - name: Check test coverage threshold (non-blocking)
-      run: |
-        if [ -f Backend/coverage.xml ]; then
-          echo "Checking coverage threshold..."
-          docker run --rm --network host \
-            -v "$GITHUB_WORKSPACE/Backend":/app \
-            -w /app \
-            -e MONGO_URI \
-            metta-backend-ci \
-            bash -lc "pytest --cov=app --cov-report=term-missing --cov-fail-under=60 || echo 'Coverage below threshold, but continuing...'"
-        else
-          echo "No coverage.xml found; skipping coverage threshold check"
-        fi
